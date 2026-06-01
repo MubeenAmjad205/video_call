@@ -7,6 +7,7 @@ const { nanoid } = require('nanoid');
 
 const config = require('./config');
 const { Room } = require('./room');
+const { auth, toNodeHandler } = require('./auth');
 
 const workers = [];
 let nextWorkerIdx = 0;
@@ -31,14 +32,13 @@ function nextWorker() {
   return worker;
 }
 
-async function getOrCreateRoom(roomId) {
+async function getOrCreateRoom(roomId, providedHostToken = null) {
   let room = rooms.get(roomId);
   if (room) return room;
-  const worker = nextWorker();
-  const router = await worker.createRouter({
-    mediaCodecs: config.mediasoup.routerOptions.mediaCodecs,
-  });
-  room = new Room(roomId, router);
+  room = new Room(roomId);
+  if (providedHostToken) {
+    room.hostToken = providedHostToken;
+  }
   rooms.set(roomId, room);
   console.log(`room created: ${roomId}`);
   return room;
@@ -48,16 +48,18 @@ async function main() {
   await createWorkers();
 
   const app = express();
-  app.use(cors({ origin: config.clientOrigin }));
+  app.use(cors({ origin: config.clientOrigin, credentials: true }));
   app.use(express.json());
+
+  app.all('/api/auth/*', toNodeHandler(auth));
 
   app.get('/health', (_req, res) => res.json({ ok: true }));
 
   // Create a new meeting room
   app.post('/rooms', async (_req, res) => {
     const roomId = nanoid(10);
-    await getOrCreateRoom(roomId);
-    res.json({ roomId });
+    const room = await getOrCreateRoom(roomId);
+    res.json({ roomId, hostToken: room.hostToken });
   });
 
   // Check if a room exists (so the client can show "meeting not found")
@@ -68,7 +70,7 @@ async function main() {
 
   const server = http.createServer(app);
   const io = new Server(server, {
-    cors: { origin: config.clientOrigin, methods: ['GET', 'POST'] },
+    cors: { origin: config.clientOrigin, methods: ['GET', 'POST'], credentials: true },
   });
 
   io.on('connection', (socket) => {
@@ -77,27 +79,54 @@ async function main() {
     let joinedRoomId = null;
     let peerId = null;
 
-    socket.on('joinRoom', async ({ roomId }, cb) => {
+    socket.on('joinRoom', async ({ roomId, hostToken }, cb) => {
       try {
-        const room = await getOrCreateRoom(roomId);
+        // Authenticate the user via better-auth
+        const session = await auth.api.getSession({
+          headers: new Headers({ cookie: socket.handshake.headers.cookie || '' }),
+        });
+        
+        if (!session) {
+          return cb({ error: 'Unauthorized: You must be logged in to join a room.' });
+        }
+
+        const room = await getOrCreateRoom(roomId, hostToken);
         peerId = socket.id;
-        room.addPeer(peerId, socket);
+        const userId = session.user.id;
+
+        const isHost = hostToken === room.hostToken;
+
+        if (room.locked && !isHost && !room.admittedPeers.has(userId)) {
+          room.waitingPeers.set(peerId, { socket, userId });
+          socket.to(roomId).emit('lobbyPeerWaiting', { peerId });
+          return cb({ status: 'waiting' });
+        }
+
+        const worker = nextWorker();
+        const peer = await room.addPeer(peerId, socket, worker);
+        peer.isHost = isHost;
+        peer.userId = userId;
         joinedRoomId = roomId;
         socket.join(roomId);
 
         const existingProducers = [];
-        for (const peer of room.getOtherPeers(peerId)) {
-          for (const producer of peer.producers.values()) {
+        for (const p of room.getOtherPeers(peerId)) {
+          for (const producer of p.producers.values()) {
             existingProducers.push({
               producerId: producer.id,
-              peerId: peer.id,
+              peerId: p.id,
               kind: producer.kind,
+              appData: producer.appData,
+              paused: producer.paused,
             });
           }
         }
 
         cb({
-          rtpCapabilities: room.router.rtpCapabilities,
+          status: 'joined',
+          isHost,
+          isLocked: room.locked,
+          rtpCapabilities: peer.router.rtpCapabilities,
           existingProducers,
         });
       } catch (err) {
@@ -106,13 +135,78 @@ async function main() {
       }
     });
 
+    socket.on('admitPeer', ({ targetPeerId, admit }, cb) => {
+      const room = rooms.get(joinedRoomId);
+      if (!room || !room.peers.get(socket.id)?.isHost) return cb?.({ error: 'Not host' });
+      
+      const waiting = room.waitingPeers.get(targetPeerId);
+      if (!waiting) return cb?.({ error: 'Peer not waiting' });
+      
+      room.waitingPeers.delete(targetPeerId);
+      if (admit) {
+        room.admittedPeers.add(waiting.userId);
+        waiting.socket.emit('lobbyAdmitted');
+      } else {
+        waiting.socket.emit('lobbyRejected');
+      }
+      if (cb) cb({ ok: true });
+    });
+
+    socket.on('kickPeer', ({ targetPeerId }, cb) => {
+      const room = rooms.get(joinedRoomId);
+      if (!room || !room.peers.get(socket.id)?.isHost) return cb?.({ error: 'Not host' });
+      
+      const targetPeer = room.peers.get(targetPeerId);
+      if (targetPeer) {
+        targetPeer.socket.emit('kicked');
+        targetPeer.socket.disconnect(true);
+      }
+      if (cb) cb({ ok: true });
+    });
+
+    socket.on('toggleMutePeer', async ({ targetPeerId, kind }, cb) => {
+      const room = rooms.get(joinedRoomId);
+      if (!room || !room.peers.get(socket.id)?.isHost) return cb?.({ error: 'Not host' });
+      
+      const targetPeer = room.peers.get(targetPeerId);
+      if (targetPeer) {
+        let targetProducer = null;
+        for (const p of targetPeer.producers.values()) {
+          if (p.kind === kind && p.appData.source !== 'screen') {
+            targetProducer = p;
+            break;
+          }
+        }
+        if (targetProducer) {
+          if (targetProducer.paused) {
+            await targetProducer.resume();
+            targetPeer.socket.emit('forceUnmuted', { kind });
+            io.to(joinedRoomId).emit('peerMuteStatus', { peerId: targetPeerId, kind, paused: false });
+          } else {
+            await targetProducer.pause();
+            targetPeer.socket.emit('forceMuted', { kind });
+            io.to(joinedRoomId).emit('peerMuteStatus', { peerId: targetPeerId, kind, paused: true });
+          }
+        }
+      }
+      if (cb) cb({ ok: true });
+    });
+
+    socket.on('toggleLock', ({ locked }, cb) => {
+      const room = rooms.get(joinedRoomId);
+      if (!room || !room.peers.get(socket.id)?.isHost) return cb?.({ error: 'Not host' });
+      room.locked = locked;
+      io.to(joinedRoomId).emit('roomLockChanged', { locked });
+      if (cb) cb({ ok: true });
+    });
+
     socket.on('createWebRtcTransport', async (_data, cb) => {
       try {
         const room = rooms.get(joinedRoomId);
         const peer = room?.peers.get(peerId);
         if (!peer) return cb({ error: 'not in room' });
 
-        const transport = await room.createWebRtcTransport();
+        const transport = await room.createWebRtcTransport(peerId);
         peer.transports.set(transport.id, transport);
 
         transport.on('dtlsstatechange', (state) => {
@@ -144,14 +238,14 @@ async function main() {
       }
     });
 
-    socket.on('produce', async ({ transportId, kind, rtpParameters }, cb) => {
+    socket.on('produce', async ({ transportId, kind, rtpParameters, appData }, cb) => {
       try {
         const room = rooms.get(joinedRoomId);
         const peer = room?.peers.get(peerId);
         const transport = peer?.transports.get(transportId);
         if (!transport) return cb({ error: 'transport not found' });
 
-        const producer = await transport.produce({ kind, rtpParameters });
+        const producer = await transport.produce({ kind, rtpParameters, appData });
         peer.producers.set(producer.id, producer);
 
         producer.on('transportclose', () => {
@@ -159,11 +253,16 @@ async function main() {
           peer.producers.delete(producer.id);
         });
 
+        // Pipe this new producer to all other routers in the room
+        await room.pipeProducerToAllOtherRouters(producer, peer.router);
+
         // Notify other peers in the room
         socket.to(joinedRoomId).emit('newProducer', {
           producerId: producer.id,
           peerId: peer.id,
           kind: producer.kind,
+          appData: producer.appData,
+          paused: producer.paused,
         });
 
         cb({ id: producer.id });
@@ -173,6 +272,47 @@ async function main() {
       }
     });
 
+    socket.on('closeProducer', ({ producerId }) => {
+      const room = rooms.get(joinedRoomId);
+      if (!room) return;
+      const peer = room.peers.get(socket.id);
+      if (!peer) return;
+
+      const producer = peer.producers.get(producerId);
+      if (producer) {
+        producer.close();
+        peer.producers.delete(producerId);
+      }
+    });
+
+    socket.on('pauseProducer', async ({ producerId }, cb) => {
+      const room = rooms.get(joinedRoomId);
+      if (!room) return cb?.({ error: 'No room' });
+      const peer = room.peers.get(socket.id);
+      if (!peer) return cb?.({ error: 'No peer' });
+      
+      const producer = peer.producers.get(producerId);
+      if (producer) {
+        await producer.pause();
+        io.to(joinedRoomId).emit('peerMuteStatus', { peerId: socket.id, kind: producer.kind, paused: true });
+      }
+      if (cb) cb({ ok: true });
+    });
+
+    socket.on('resumeProducer', async ({ producerId }, cb) => {
+      const room = rooms.get(joinedRoomId);
+      if (!room) return cb?.({ error: 'No room' });
+      const peer = room.peers.get(socket.id);
+      if (!peer) return cb?.({ error: 'No peer' });
+      
+      const producer = peer.producers.get(producerId);
+      if (producer) {
+        await producer.resume();
+        io.to(joinedRoomId).emit('peerMuteStatus', { peerId: socket.id, kind: producer.kind, paused: false });
+      }
+      if (cb) cb({ ok: true });
+    });
+
     socket.on('consume', async ({ producerId, rtpCapabilities, transportId }, cb) => {
       try {
         const room = rooms.get(joinedRoomId);
@@ -180,7 +320,7 @@ async function main() {
         const transport = peer?.transports.get(transportId);
         if (!transport) return cb({ error: 'transport not found' });
 
-        if (!room.router.canConsume({ producerId, rtpCapabilities })) {
+        if (!peer.router.canConsume({ producerId, rtpCapabilities })) {
           return cb({ error: 'cannot consume' });
         }
 
@@ -225,6 +365,21 @@ async function main() {
       }
     });
 
+    socket.on('chatMessage', ({ text }, cb) => {
+      try {
+        if (!joinedRoomId) return cb?.({ error: 'not in room' });
+        socket.to(joinedRoomId).emit('chatMessage', {
+          peerId,
+          text,
+          timestamp: Date.now(),
+        });
+        if (cb) cb({ ok: true });
+      } catch (err) {
+        console.error('chatMessage error', err);
+        if (cb) cb({ error: err.message });
+      }
+    });
+
     socket.on('disconnect', () => {
       console.log(`socket disconnected: ${socket.id}`);
       if (!joinedRoomId) return;
@@ -233,7 +388,9 @@ async function main() {
       room.removePeer(peerId);
       socket.to(joinedRoomId).emit('peerLeft', { peerId });
       if (room.isEmpty()) {
-        room.router.close();
+        for (const router of room.routers.values()) {
+          router.close();
+        }
         rooms.delete(joinedRoomId);
         console.log(`room closed: ${joinedRoomId}`);
       }

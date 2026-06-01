@@ -4,6 +4,20 @@ A minimal video calling app built with **mediasoup** (SFU), **Node.js**, and **N
 
 ---
 
+## Features (Production-Ready Updates)
+
+This repository has recently undergone a major transformation from a basic MVP into a high-concurrency, production-grade video platform:
+
+- **Premium UI/UX**: Professional & industry-grade dark mode aesthetic, responsive dynamic flex grid, frosted glassmorphism overlays, and user-friendly connection/permission loaders.
+- **Authentication**: Integrated `better-auth` with MongoDB for secure user sign-ups, session management, and one-click "Continue as Guest" access.
+- **Host Controls & Moderation**: Meeting hosts can lock rooms, manage a waiting room lobby, forcefully mute participant microphones, and kick disruptive users.
+- **Screen Sharing**: Fully synchronized screen sharing pipelines with dynamic layout adjustments.
+- **Real-Time Chat**: Integrated collapsible sidebar for in-room text chat.
+- **WebRTC Simulcast**: Video streams automatically adapt quality based on network conditions using 3-layer spatial simulcast encoding.
+- **Worker Scaling**: Built-in cross-worker load balancing allowing the app to distribute room load effectively.
+
+---
+
 ## Contents
 
 1. [Architecture](#architecture)
@@ -259,13 +273,15 @@ Open `http://localhost:3000` in two browser windows (or one regular + one incogn
 | `announcedIp`           | `127.0.0.1`                          | The IP put into ICE candidates; override with `MEDIASOUP_ANNOUNCED_IP` |
 | `mediaCodecs`           | opus, VP8, H264                      | Add/remove codecs here                                      |
 
-### Client ([client/.env.local](client/.env.local))
+### Client ([client/.env.local](client/.env.local) or `client/.env`)
 
 ```env
 NEXT_PUBLIC_SERVER_URL=http://localhost:4000
 ```
 
 Point this at wherever the signaling server runs.
+
+> **Note:** For a complete configuration reference, please see the `example.env` file in the root directory.
 
 ---
 
@@ -297,12 +313,7 @@ Options:
 
 ## Limitations & next steps
 
-This is an MVP. Things deliberately left out:
+While the core MVP limitations have been resolved (Authentication, Host Controls, Simulcast, Chat, Screen Sharing, and Worker Load Balancing), the following architecture steps are next on the roadmap:
 
-- **No persistence.** Rooms live in server memory and disappear on restart.
-- **No auth.** Anyone with a room ID can join.
-- **No host controls** (kick, mute others, lobby).
-- **No screen sharing or chat.** Both are straightforward additions — screen sharing is another `produce` with `getDisplayMedia()`; chat is a Socket.io broadcast event.
-- **No simulcast / SVC.** Each producer publishes one layer. For larger calls, enable simulcast in `sendTransport.produce({ track, encodings: [...] })`.
-- **No TURN server.** Will fail on restrictive NATs.
-- **Single-server.** Scaling across machines needs a mediasoup `PipeTransport` topology or a workspace like [mediasoup-demo](https://github.com/versatica/mediasoup-demo).
+- **TURN Server Implementation**: While the current setup works on standard connections, restrictive symmetric NATs will require a deployed TURN server integration (e.g., coturn) for guaranteed global peer-to-peer relay fallback.
+- **Persisted Chat Logs**: Chat is currently ephemeral for the session; long-term persistence in MongoDB can be added for post-meeting records.
